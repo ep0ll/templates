@@ -472,3 +472,336 @@ FROM release
 # dynamic loading and native dependencies. EF migrations should be explicit
 # deployment jobs rather than implicit startup mutations.
 # ============================================================================
+
+# ============================================================================
+# SUPPORTED SDK TARGETS
+# ============================================================================
+# - .NET 10 LTS is the fallback default.
+# - .NET 9 remains supported when pinned by global.json or DOTNET_VERSION.
+# - .NET 8 LTS remains supported when pinned by the repository.
+# - Older supported TFMs should be explicitly pinned and tested rather than silently selected.
+# - global.json controls SDK selection and roll-forward policy.
+# - .dotnet-version is supported for repositories using a version-manager convention.
+
+# ============================================================================
+# PROJECT TYPES
+# ============================================================================
+# - ASP.NET Core web SDK projects.
+# - Console applications and Generic Host applications.
+# - Worker Service applications.
+# - Blazor Server applications.
+# - Blazor WebAssembly applications.
+# - gRPC services.
+# - SignalR applications.
+# - YARP reverse proxies.
+# - Azure Functions isolated worker applications.
+# - AWS Lambda .NET container applications.
+# - Orleans silo/worker applications.
+# - Dapr-enabled services.
+# - .NET Aspire application projects.
+# - EF Core applications.
+# - Native AOT applications.
+
+# ============================================================================
+# PROJECT FILES
+# ============================================================================
+# - C# csproj files.
+# - F# fsproj files.
+# - Visual Basic vbproj files.
+# - MSBuild Directory.Build.props.
+# - MSBuild Directory.Build.targets.
+# - Directory.Packages.props central package versions.
+# - packages.lock.json dependency locks.
+# - NuGet.config and nuget.config.
+# - global.json SDK pinning.
+# - .config/dotnet-tools.json local tools.
+# - paket.dependencies.
+# - paket.lock.
+# - .sln solution files.
+# - .slnx solution files.
+
+# ============================================================================
+# PACKAGE MANAGEMENT
+# ============================================================================
+# - NuGet is the default package manager.
+# - Private feeds can be configured through a secret-mounted NuGet.config.
+# - Paket repositories are detected from paket.dependencies or paket.lock.
+# - MyGet and ProGet remain NuGet-compatible feed scenarios.
+# - LibMan remains available for client-side library assets.
+# - Repository-local dotnet tools are restored from the tool manifest.
+# - Credential providers should be supplied by the CI environment rather than baked into the image.
+
+# ============================================================================
+# RESTORE BEHAVIOR
+# ============================================================================
+# - Restore is isolated from source compilation for cache reuse.
+# - NuGet global packages are stored in a BuildKit cache mount.
+# - NuGet HTTP metadata is stored in a separate BuildKit cache mount.
+# - Locked restore can be forced with RESTORE_LOCKED=true.
+# - packages.lock.json can be used to make auto mode enforce locked restore.
+# - Private-feed credentials are exposed only to the restore operation.
+# - The secret-mounted NuGet.config is removed before the restore stage completes.
+# - Restore should fail closed for missing private package credentials.
+
+# ============================================================================
+# BUILD BEHAVIOR
+# ============================================================================
+# - Build never performs an implicit second restore.
+# - Release is the default configuration.
+# - Deterministic compilation is enabled by default.
+# - ContinuousIntegrationBuild is enabled when Source Link integration is enabled.
+# - Build output remains outside the runtime stage.
+# - Compiler warnings and errors remain application policy; this template does not hide them.
+# - The test stage is separate from the production artifact.
+
+# ============================================================================
+# PUBLISH MODES
+# ============================================================================
+# - Framework-dependent publish is the normal default.
+# - Self-contained publish is selected with DEPLOYMENT_TYPE=self-contained.
+# - Native AOT is selected with ENABLE_AOT=true or the project PublishAot property.
+# - Trimming can be selected with PUBLISH_TRIMMED=true.
+# - Single-file can be selected with PUBLISH_SINGLE_FILE=true.
+# - ReadyToRun can be selected with PUBLISH_READYTORUN=true.
+# - TARGET_RID selects a concrete runtime identifier.
+# - Native deployment assets should use a fixed RID in release pipelines.
+
+# ============================================================================
+# RUNTIME IMAGES
+# ============================================================================
+# - ASP.NET Core applications use the ASP.NET runtime family.
+# - Console and worker applications can use the .NET runtime family.
+# - Native AOT uses runtime-deps-compatible images.
+# - Chiseled images are the default production target.
+# - Alpine should be selected deliberately when musl compatibility is required.
+# - Do not assume Debian/glibc native binaries are compatible with Alpine/musl.
+# - Globalization-invariant mode is opt-in through GLOBALIZATION_INVARIANT.
+# - WASM applications are treated as static content rather than server applications.
+
+# ============================================================================
+# SECURITY BASELINE
+# ============================================================================
+# - Production executes as a non-root UID.
+# - The SDK is never copied into the final image.
+# - Git is never required at runtime.
+# - Package managers are never required at runtime.
+# - Compiler toolchains are never copied into the final image.
+# - Runtime diagnostics are disabled unless explicitly enabled.
+# - No package-feed token is persisted into the final image.
+# - No cloud credential is persisted into the final image.
+# - No TLS private key should be persisted into the final image.
+# - The image should be scanned before release.
+# - The image should be deployed by digest.
+
+# ============================================================================
+# HEALTH AND OBSERVABILITY
+# ============================================================================
+# - This template does not assume curl or wget exists in the runtime.
+# - Chiseled images intentionally omit common diagnostic utilities.
+# - Kubernetes readiness probes should target the application's real readiness endpoint.
+# - Kubernetes liveness probes should target the application's real liveness endpoint.
+# - OpenTelemetry configuration belongs in deployment configuration or application configuration.
+# - Application logs should use stdout/stderr for container-native collection.
+# - Do not make healthchecks depend on an endpoint that the application does not implement.
+
+# ============================================================================
+# SUPPLY CHAIN
+# ============================================================================
+# - Use a pinned SDK version for release builds.
+# - Use lock files for dependencies where deterministic resolution is required.
+# - Generate SBOM metadata in CI.
+# - Generate provenance attestations in CI.
+# - Scan both source dependencies and the resulting image.
+# - Prefer immutable base-image digests for highly controlled release pipelines.
+# - Record the source commit in OCI provenance.
+# - Do not make package feeds reachable from the final runtime stage.
+
+# ============================================================================
+# CI PIPELINE
+# ============================================================================
+# - Validate Dexfile syntax before building.
+# - Build the restore stage to verify dependency resolution.
+# - Run ENABLE_TESTS=true for verification builds.
+# - Run separate architecture builds when native dependencies differ.
+# - Publish artifacts only from successful verification builds.
+# - Generate SBOM and provenance after publishing.
+# - Scan the final image before pushing.
+# - Push immutable digest references.
+# - Promote the exact digest between environments.
+
+# ============================================================================
+# MONOREPO GUIDANCE
+# ============================================================================
+# - Prefer a solution or solutionx file at the repository boundary.
+# - Use Directory.Build.props for shared compiler settings.
+# - Use Directory.Packages.props for central package versions.
+# - Use packages.lock.json where reproducible restore is required.
+# - Avoid selecting a project solely because it sorts first alphabetically.
+# - For multiple deployable services, invoke the template once per service project.
+# - Do not copy unrelated monorepo secrets into service images.
+# - Keep service-specific publish settings in the project or invocation.
+
+# ============================================================================
+# EF CORE
+# ============================================================================
+# - EF Core packages are restored through normal NuGet resolution.
+# - Provider native libraries must match the selected runtime libc and architecture.
+# - Database migrations should be an explicit deployment operation.
+# - Do not put production database credentials in the image.
+# - Do not automatically run destructive migrations during container startup.
+# - Health endpoints should distinguish process health from database readiness when appropriate.
+
+# ============================================================================
+# ASP.NET CORE
+# ============================================================================
+# - Use ASPNETCORE_ENVIRONMENT=Production in the runtime image.
+# - Use ASPNETCORE_HTTP_PORTS for the default container port.
+# - ASPNETCORE_URLS is provided for compatibility with applications that use it.
+# - Terminate TLS at an ingress/load balancer unless the application explicitly owns TLS.
+# - Use forwarded-header configuration appropriate to the ingress topology.
+# - Configure request limits, timeouts and Kestrel settings in application configuration.
+
+# ============================================================================
+# BLAZOR WASM
+# ============================================================================
+# - Blazor WebAssembly output is static content.
+# - A static web server should serve the published wwwroot.
+# - Client-side assets should receive immutable caching only when filenames are content-versioned.
+# - SPA fallback behavior belongs in the web-server configuration.
+# - Do not expose server-only secrets in a WebAssembly application.
+
+# ============================================================================
+# GRPC AND SIGNALR
+# ============================================================================
+# - HTTP/2 and protocol requirements belong in the deployment platform configuration.
+# - Ingress proxies must preserve the required protocol semantics.
+# - Readiness endpoints should remain independent of long-lived streaming connections.
+# - Do not use a streaming endpoint as a liveness probe.
+
+# ============================================================================
+# WORKERS
+# ============================================================================
+# - Worker services should run as PID 1 in the container.
+# - Shutdown behavior should honor SIGTERM and the Generic Host cancellation token.
+# - Long-running jobs should implement graceful shutdown.
+# - External queues and credentials belong in runtime configuration.
+# - Do not add an HTTP server merely to manufacture a healthcheck.
+
+# ============================================================================
+# ORLEANS DAPR ASPIRE
+# ============================================================================
+# - These frameworks frequently use multiple cooperating processes or sidecars.
+# - The application image should contain only the application process and its runtime dependencies.
+# - Dapr sidecars should be supplied by the platform.
+# - Aspire orchestration is normally a development/deployment concern; production services should publish independently.
+# - Orleans clustering and persistence configuration belongs outside the image.
+
+# ============================================================================
+# AZURE FUNCTIONS
+# ============================================================================
+# - Functions hosting images have platform-specific entrypoint requirements.
+# - Do not replace a Functions host entrypoint with a generic dotnet app.dll command.
+# - Use the Functions base-image guidance for the selected .NET isolated worker version.
+# - Secrets and storage configuration remain runtime configuration.
+
+# ============================================================================
+# AWS LAMBDA
+# ============================================================================
+# - Lambda container images have Lambda-specific entrypoint behavior.
+# - The handler and Lambda environment configuration belong in the function configuration.
+# - Use AWS-provided .NET Lambda base images when the Lambda execution contract requires them.
+# - Do not treat a Lambda image as a generic Kubernetes web server image.
+
+# ============================================================================
+# NATIVE AOT
+# ============================================================================
+# - Native AOT reduces runtime dependencies but imposes application compatibility constraints.
+# - Reflection-heavy applications may require source generation or trimming annotations.
+# - Dynamic assembly loading may not work as expected.
+# - Native libraries must exist for the target architecture.
+# - Use TARGET_RID for reproducible native assets.
+# - Test the produced executable on the actual deployment architecture.
+
+# ============================================================================
+# TRIMMING
+# ============================================================================
+# - Trimming is not universally safe for every application.
+# - Reflection and serialization frameworks may require annotations or source generation.
+# - Treat trim warnings as release engineering signals.
+# - Enable trimming only after application verification.
+# - Keep the untrimmed deployment mode available as a fallback.
+
+# ============================================================================
+# ALPINE
+# ============================================================================
+# - Alpine uses musl libc.
+# - Native dependencies compiled against glibc may not run on Alpine.
+# - Use Alpine intentionally rather than as a universal size optimization.
+# - Test all native database, graphics, crypto and compression dependencies on musl.
+# - When compatibility is more important than image size, use a glibc-based runtime.
+
+# ============================================================================
+# GLOBALIZATION
+# ============================================================================
+# - GLOBALIZATION_INVARIANT=false is the default.
+# - Applications using culture-sensitive parsing and formatting should retain globalization data.
+# - Invariant globalization can reduce image requirements but changes runtime behavior.
+# - Locale, timezone and ICU requirements should be tested as application behavior.
+
+# ============================================================================
+# FILESYSTEM
+# ============================================================================
+# - Treat the application filesystem as immutable.
+# - Use /tmp only for temporary runtime state.
+# - Persist user uploads and generated business data through external storage.
+# - Do not depend on writes to the application directory.
+# - Use read-only root filesystems where the orchestrator supports them.
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+# - Use environment variables for non-secret deployment configuration.
+# - Use the orchestrator secret mechanism for credentials.
+# - Do not bake environment-specific URLs into the image.
+# - Do not bake tenant identifiers or production-only settings into a generic image.
+# - Keep the same image digest across promotion environments.
+
+# ============================================================================
+# NETWORKING
+# ============================================================================
+# - Expose only the application port required by the service.
+# - Do not install diagnostic network clients into production images.
+# - Network policy belongs to the orchestrator or cloud network layer.
+# - Private package feeds are build-time dependencies, not runtime dependencies.
+# - Outbound access from the final runtime should be restricted where practical.
+
+# ============================================================================
+# IMAGE LABELS
+# ============================================================================
+# - OCI vendor metadata identifies Dexnore.
+# - OCI source metadata identifies this repository.
+# - Application framework and .NET version are recorded as labels.
+# - Deployment type and AOT mode are recorded as labels.
+# - Workspace and RID information are recorded as labels.
+# - Security posture is recorded as a non-root label.
+
+# ============================================================================
+# OVERRIDES
+# ============================================================================
+# - DOTNET_VERSION overrides automatic SDK detection.
+# - BUILD_IMAGE overrides the SDK image.
+# - RUN_IMAGE overrides runtime image selection.
+# - RUNTIME_FLAVOR selects the runtime family.
+# - TARGET_RID selects a runtime identifier.
+# - BUILD_CONFIGURATION selects Debug/Release or another configuration.
+# - DEPLOYMENT_TYPE selects framework-dependent/self-contained behavior.
+# - ENABLE_AOT explicitly enables Native AOT.
+# - PUBLISH_TRIMMED controls trimming.
+# - PUBLISH_SINGLE_FILE controls single-file publishing.
+# - PUBLISH_READYTORUN controls ReadyToRun.
+# - RESTORE_LOCKED controls locked restore policy.
+# - PRIVATE_FEED_SECRET_ID controls the secret name.
+# - ENABLE_TESTS enables the test stage.
+# - ENABLE_RUNTIME_DIAGNOSTICS enables runtime diagnostics when necessary.
+
+# END OF C# / .NET PRODUCTION STANDARD
