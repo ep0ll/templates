@@ -11,6 +11,22 @@
 
 ARG DOTNET_VERSION DOTNET_RUNTIME BUILD_IMAGE RUN_IMAGE
 ARG FRAMEWORK_TYPE DEPLOYMENT_TYPE BUILD_CONFIGURATION=Release
+ARG TARGET_RID
+ARG RUNTIME_FLAVOR=chiseled
+ARG GLOBALIZATION_INVARIANT=false
+ARG PUBLISH_TRIMMED=auto
+ARG PUBLISH_SINGLE_FILE=auto
+ARG PUBLISH_READYTORUN=false
+ARG RESTORE_LOCKED=auto
+ARG ENABLE_TESTS=false
+ARG TEST_CONFIGURATION=Release
+ARG TEST_FILTER
+ARG ENABLE_SOURCE_LINK=true
+ARG ENABLE_DETERMINISTIC=true
+ARG ENABLE_RUNTIME_DIAGNOSTICS=false
+ARG NUGET_PACKAGES=/root/.nuget/packages
+ARG NUGET_HTTP_CACHE=/root/.local/share/NuGet/http-cache
+ARG PRIVATE_FEED_SECRET_ID=nuget-config
 ARG PROJECT_TYPE PACKAGE_MANAGER ENABLE_AOT=false
 ARG PORT=8080 ASPNETCORE_HTTP_PORTS=8080
 ARG NGINX_ROOT="/usr/share/nginx/html"
@@ -35,7 +51,7 @@ FUNC detect_dotnet_version
             ARG DOTNET_VERSION=${STDOUT}
         ENDIF
     ELSE
-        ARG DOTNET_VERSION="9.0"
+        ARG DOTNET_VERSION="10.0"
     ENDIF
     
     # Normalize version (e.g., "9.0" -> "9.0", "9" -> "9.0")
@@ -211,6 +227,34 @@ FUNC detect_solution_structure
 ENDFUNC
 
 # ============================================================================
+# WORKSPACE / REPRODUCIBILITY POLICY
+# ============================================================================
+FUNC detect_workspace_policy
+    ARG WORKSPACE_TYPE="single-project"
+    IF PROC --from=busybox:latest --mount=target=. [ -f "Directory.Packages.props" ]
+        ARG WORKSPACE_TYPE="central-package-management"
+    ELSE IF PROC --from=busybox:latest --mount=target=. find . -maxdepth 2 -name "*.slnx" | head -1
+        ARG WORKSPACE_TYPE="solutionx"
+    ELSE IF PROC --from=busybox:latest --mount=target=. find . -maxdepth 2 -name "*.sln" | head -1
+        ARG WORKSPACE_TYPE="solution"
+    ENDIF
+ENDFUNC
+FUNC detect_publish_policy
+    ARG PUBLISH_TRIMMED_EFFECTIVE=false
+    ARG PUBLISH_SINGLE_FILE_EFFECTIVE=false
+    IF PROC [ "${PUBLISH_TRIMMED}" = "true" ] || PROC [ "${PUBLISH_TRIMMED}" = "auto" ] && PROC grep -Rqi "<PublishTrimmed>true</PublishTrimmed>" --include="*.csproj" .
+        ARG PUBLISH_TRIMMED_EFFECTIVE=true
+    ENDIF
+    IF PROC [ "${PUBLISH_SINGLE_FILE}" = "true" ] || PROC [ "${PUBLISH_SINGLE_FILE}" = "auto" ] && PROC grep -Rqi "<PublishSingleFile>true</PublishSingleFile>" --include="*.csproj" .
+        ARG PUBLISH_SINGLE_FILE_EFFECTIVE=true
+    ENDIF
+    ARG PUBLISH_TRIMMED=${PUBLISH_TRIMMED_EFFECTIVE}
+    ARG PUBLISH_SINGLE_FILE=${PUBLISH_SINGLE_FILE_EFFECTIVE}
+ENDFUNC
+FUNC CALL detect_workspace_policy
+FUNC CALL detect_publish_policy
+
+# ============================================================================
 # RUN DETECTIONS
 # ============================================================================
 FUNC CALL detect_dotnet_version
@@ -222,9 +266,9 @@ FUNC CALL select_runtime_image
 
 # Set build image based on version
 IF PROC [ -n "${DOTNET_VERSION}" ]
-    ARG BUILD_IMAGE="mcr.microsoft.com/dotnet/sdk:${DOTNET_VERSION}-bookworm-slim"
+    ARG BUILD_IMAGE="mcr.microsoft.com/dotnet/sdk:${DOTNET_VERSION}"
 ELSE
-    ARG BUILD_IMAGE="mcr.microsoft.com/dotnet/sdk:9.0-bookworm-slim"
+    ARG BUILD_IMAGE="mcr.microsoft.com/dotnet/sdk:10.0"
 ENDIF
 
 # ============================================================================
@@ -256,55 +300,53 @@ ENV ASPNETCORE_ENVIRONMENT=Production
 # ============================================================================
 FROM base AS restore
 
-# Copy NuGet configuration files
-COPY NuGet.config* nuget.config* ./ 2>/dev/null || true
-COPY global.json* .dotnet-version* ./ 2>/dev/null || true
+WORKDIR /home/dexnore/app
+COPY global.json* .dotnet-version* ./
+COPY NuGet.config* nuget.config* ./
+COPY Directory.Build.props Directory.Build.targets Directory.Packages.props ./
+COPY *.sln* ./
+COPY */*.csproj ./
+COPY **/*.csproj ./
+COPY packages.lock.json ./
+COPY **/packages.lock.json ./
+COPY paket.dependencies paket.lock ./
+COPY .config/dotnet-tools.json ./.config/dotnet-tools.json
 
-# Copy solution and project files for restore
-COPY *.sln* ./ 2>/dev/null || true
-COPY */*.csproj ./ 2>/dev/null || true
-COPY **/*.csproj ./ 2>/dev/null || true
-
-# Copy Paket files if using Paket
-IF PROC [ "${PACKAGE_MANAGER}" = "paket" ]
-    COPY paket.dependencies paket.lock .paket/ ./ 2>/dev/null || true
-    COPY .paket/ ./.paket/ 2>/dev/null || true
-ENDIF
-
-# Copy libman.json if exists
-IF PROC echo "${PACKAGE_MANAGER}" | grep -q "libman"
-    COPY libman.json ./ 2>/dev/null || true
-ENDIF
-
-# Install package manager tools
-RUN --mount=type=cache,id=nuget-packages,target=/root/.nuget/packages,sharing=locked \
-    --mount=type=secret,id=nuget-config,target=/home/dexfile/app/NuGet.config \
-    set -e; \
-    if [ "${PACKAGE_MANAGER}" = "paket" ]; then \
-        dotnet tool restore || dotnet tool install --tool-path /usr/local/bin paket; \
-    fi; \
-    if echo "${PACKAGE_MANAGER}" | grep -q "libman"; then \
-        dotnet tool install --global Microsoft.Web.LibraryManager.Cli 2>/dev/null || true; \
-    fi
-
-# Restore dependencies
-RUN --mount=type=cache,id=nuget-packages,target=/root/.nuget/packages,sharing=locked \
-    --mount=type=secret,id=nuget-config,target=/home/dexfile/app/NuGet.config \
-    set -e; \
-    if [ "${PACKAGE_MANAGER}" = "paket" ]; then \
-        paket restore; \
-    elif [ -n "${SOLUTION_FILE}" ]; then \
-        dotnet restore "${SOLUTION_FILE}" --locked-mode; \
-    elif [ -n "${PROJECT_FILE}" ]; then \
-        dotnet restore "${PROJECT_FILE}" --locked-mode; \
-    else \
-        dotnet restore --locked-mode; \
-    fi; \
-    if echo "${PACKAGE_MANAGER}" | grep -q "libman"; then \
-        libman restore 2>/dev/null || true; \
-    fi
+RUN --mount=type=cache,id=dotnet-nuget,target=${NUGET_PACKAGES},sharing=locked \
+    --mount=type=cache,id=dotnet-http,target=${NUGET_HTTP_CACHE},sharing=locked \
+    --mount=type=secret,id=${PRIVATE_FEED_SECRET_ID},target=/tmp/NuGet.config,required=false \
+    set -eu; \
+    if [ -f /tmp/NuGet.config ]; then cp /tmp/NuGet.config ./NuGet.config; fi; \
+    if [ -f .config/dotnet-tools.json ]; then dotnet tool restore; fi; \
+    if [ "${PACKAGE_MANAGER}" = "paket" ]; then dotnet tool install --tool-path /tmp/paket paket --version 8.* >/dev/null 2>&1 || true; /tmp/paket/paket restore; \
+    elif [ -n "${SOLUTION_FILE}" ]; then dotnet restore "${SOLUTION_FILE}" --nologo; \
+    elif [ -n "${PROJECT_FILE}" ]; then dotnet restore "${PROJECT_FILE}" --nologo; \
+    else dotnet restore --nologo; fi; \
+    rm -f ./NuGet.config
 
 # ============================================================================
+# BUILD STAGE
+# ============================================================================
+FROM restore AS build
+WORKDIR /home/dexnore/app
+COPY . .
+RUN --mount=type=cache,id=dotnet-nuget,target=${NUGET_PACKAGES},sharing=locked \
+    set -eu; \
+    PROPS="/p:Deterministic=${ENABLE_DETERMINISTIC}"; \
+    if [ "${ENABLE_SOURCE_LINK}" = "true" ]; then PROPS="${PROPS} /p:ContinuousIntegrationBuild=true /p:EnableSourceLink=true"; fi; \
+    if [ -n "${SOLUTION_FILE}" ]; then dotnet build "${SOLUTION_FILE}" --configuration ${BUILD_CONFIGURATION} --no-restore --nologo $PROPS; \
+    elif [ -n "${PROJECT_FILE}" ]; then dotnet build "${PROJECT_FILE}" --configuration ${BUILD_CONFIGURATION} --no-restore --nologo $PROPS; \
+    else dotnet build --configuration ${BUILD_CONFIGURATION} --no-restore --nologo $PROPS; fi
+
+FROM build AS test
+RUN --mount=type=cache,id=dotnet-nuget,target=${NUGET_PACKAGES},sharing=locked \
+    set -eu; \
+    if [ "${ENABLE_TESTS}" = "true" ]; then \
+      if [ -n "${SOLUTION_FILE}" ]; then dotnet test "${SOLUTION_FILE}" --configuration ${TEST_CONFIGURATION} --no-build --no-restore --nologo; \
+      else dotnet test "${PROJECT_FILE}" --configuration ${TEST_CONFIGURATION} --no-build --no-restore --nologo; fi; \
+    fi
+
+============================================================================
 # BUILD STAGE
 # ============================================================================
 FROM restore AS build
@@ -333,175 +375,100 @@ RUN --mount=type=cache,id=nuget-packages,target=/root/.nuget/packages,sharing=lo
 # PUBLISH STAGE
 # ============================================================================
 FROM build AS publish
-
-# Publish the application with appropriate settings
-RUN --mount=type=cache,id=nuget-packages,target=/root/.nuget/packages,sharing=locked \
-    set -e; \
-    PUBLISH_ARGS="--configuration ${BUILD_CONFIGURATION} --no-restore --no-build"; \
-    if [ "${ENABLE_AOT}" = "true" ]; then \
-        PUBLISH_ARGS="${PUBLISH_ARGS} /p:PublishAot=true /p:StripSymbols=true"; \
-    elif [ "${DEPLOYMENT_TYPE}" = "self-contained" ]; then \
-        PUBLISH_ARGS="${PUBLISH_ARGS} --self-contained true"; \
-    elif [ "${DEPLOYMENT_TYPE}" = "trimmed" ]; then \
-        PUBLISH_ARGS="${PUBLISH_ARGS} /p:PublishTrimmed=true /p:PublishSingleFile=true"; \
-    else \
-        PUBLISH_ARGS="${PUBLISH_ARGS} --self-contained false"; \
-    fi; \
-    if [ -n "${PROJECT_FILE}" ]; then \
-        dotnet publish "${PROJECT_FILE}" ${PUBLISH_ARGS} --output /app/publish; \
-    else \
-        dotnet publish ${PUBLISH_ARGS} --output /app/publish; \
-    fi
+WORKDIR /home/dexnore/app
+RUN --mount=type=cache,id=dotnet-nuget,target=${NUGET_PACKAGES},sharing=locked \
+    set -eu; \
+    ARGS="--configuration ${BUILD_CONFIGURATION} --no-restore --nologo --output /app/publish"; \
+    if [ "${ENABLE_AOT}" = "true" ]; then ARGS="${ARGS} --self-contained true /p:PublishAot=true /p:StripSymbols=true"; fi; \
+    if [ "${DEPLOYMENT_TYPE}" = "self-contained" ]; then ARGS="${ARGS} --self-contained true"; fi; \
+    if [ "${DEPLOYMENT_TYPE}" = "framework-dependent" ]; then ARGS="${ARGS} --self-contained false"; fi; \
+    if [ "${PUBLISH_TRIMMED}" = "true" ]; then ARGS="${ARGS} /p:PublishTrimmed=true"; fi; \
+    if [ "${PUBLISH_SINGLE_FILE}" = "true" ]; then ARGS="${ARGS} /p:PublishSingleFile=true"; fi; \
+    if [ "${PUBLISH_READYTORUN}" = "true" ]; then ARGS="${ARGS} /p:PublishReadyToRun=true"; fi; \
+    if [ -n "${TARGET_RID}" ]; then ARGS="${ARGS} --runtime ${TARGET_RID}"; fi; \
+    if [ -n "${PROJECT_FILE}" ]; then dotnet publish "${PROJECT_FILE}" $ARGS; else dotnet publish $ARGS; fi
 
 # ============================================================================
 # RUNTIME BASE STAGE
 # ============================================================================
 FROM ${RUN_IMAGE} AS app
-
-# Create non-root user
-RUN if command -v addgroup >/dev/null 2>&1; then \
-        addgroup --system --gid 1000 dexnore 2>/dev/null || true; \
-        adduser --system --disabled-password --no-create-home --uid 1000 --gid 1000 dexfile 2>/dev/null || true; \
-    elif command -v groupadd >/dev/null 2>&1; then \
-        groupadd -r -g 1000 dexnore 2>/dev/null || true; \
-        useradd -r -u 1000 -g dexnore -d /home/dexfile/app -s /sbin/nologin dexfile 2>/dev/null || true; \
-    fi && \
-    mkdir -p /home/dexfile/app && \
-    chown -R 1000:1000 /home/dexfile/app 2>/dev/null || true
-
-WORKDIR /home/dexfile/app
-USER dexfile
-
+WORKDIR /app
 ENV ASPNETCORE_ENVIRONMENT=Production
 ENV ASPNETCORE_HTTP_PORTS=${ASPNETCORE_HTTP_PORTS}
+ENV ASPNETCORE_URLS=http://+:${PORT}
 ENV DOTNET_RUNNING_IN_CONTAINER=true
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
-
-EXPOSE ${PORT}
-
-# ============================================================================
-# PRODUCTION STAGE
-# ============================================================================
-FROM app AS prod
-
-# Handle nginx static serving (for Blazor WASM, OpenSilver, etc.)
-IF PROC [ "${PROJECT_TYPE}" = "wasm" ]
-    # Copy nginx config if exists
-    IF PROC --from=busybox:latest --mount=target=. [ -f "nginx.conf" ]
-        COPY --chown=root:root nginx.conf /etc/nginx/conf.d/default.conf
-    ELSE IF PROC --from=busybox:latest --mount=target=. [ -f "Caddyfile" ]
-        COPY --chown=root:root Caddyfile /etc/caddy/Caddyfile
-    ELSE
-        # Create default nginx config for Blazor WASM
-        RUN echo 'server { \
-            listen 80; \
-            root /usr/share/nginx/html; \
-            index index.html; \
-            location / { \
-                try_files $uri $uri/ /index.html =404; \
-            } \
-            location ~* \.(dll|wasm|blat|dat)$ { \
-                add_header Content-Type application/octet-stream; \
-                add_header Cache-Control "public, max-age=31536000, immutable"; \
-            } \
-            location ~* \.(js|css|json)$ { \
-                add_header Cache-Control "public, max-age=31536000, immutable"; \
-            } \
-            gzip on; \
-            gzip_types application/wasm application/octet-stream text/plain text/css application/json application/javascript; \
-        }' > /etc/nginx/conf.d/default.conf
-    ENDIF
-    
-    # Copy published WASM files
-    IF PROC [ "${FRAMEWORK_TYPE}" = "blazor-wasm" ]
-        COPY --chown=nginx:nginx --from=publish /app/publish/wwwroot ${NGINX_ROOT}/
-    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "opensilver" ]
-        COPY --chown=nginx:nginx --from=publish /app/publish/ClientBin ${NGINX_ROOT}/ClientBin/
-        COPY --chown=nginx:nginx --from=publish /app/publish/wwwroot ${NGINX_ROOT}/ 2>/dev/null || true
-    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "uno-platform" ]
-        COPY --chown=nginx:nginx --from=publish /app/publish ${NGINX_ROOT}/
-    ELSE
-        COPY --chown=nginx:nginx --from=publish /app/publish/wwwroot ${NGINX_ROOT}/ 2>/dev/null || \
-             COPY --chown=nginx:nginx --from=publish /app/publish ${NGINX_ROOT}/
-    ENDIF
-    
-    # Set proper permissions
-    RUN chown -R nginx:nginx ${NGINX_ROOT} && chmod -R 755 ${NGINX_ROOT}
-    
-    CMD ["nginx", "-g", "daemon off;"]
-
-# Handle .NET runtime
-ELSE
-    # Copy published application
-    COPY --chown=dexfile:dexfile --from=publish /app/publish ./
-    
-    # Find the entry point DLL or executable
-    RUN if [ "${ENABLE_AOT}" = "true" ]; then \
-            ENTRY_POINT=$(find . -maxdepth 1 -type f -executable ! -name "*.so" ! -name "*.dylib" | head -1); \
-            if [ -n "${ENTRY_POINT}" ]; then \
-                ln -s "${ENTRY_POINT}" /home/dexfile/app/app || true; \
-            fi; \
-        else \
-            ENTRY_DLL=$(find . -maxdepth 1 -name "*.dll" ! -name "*.Views.dll" ! -name "*.PrecompiledViews.dll" | head -1); \
-            if [ -n "${ENTRY_DLL}" ]; then \
-                ln -s "${ENTRY_DLL}" /home/dexfile/app/app.dll || true; \
-            fi; \
-        fi
-    
-    # Framework-specific health checks
-    IF PROC [ "${FRAMEWORK_TYPE}" = "aspnetcore" ] || [ "${FRAMEWORK_TYPE}" = "blazor-server" ]
-        HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-            CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:${PORT}/health 2>/dev/null || \
-                wget --no-verbose --tries=1 --spider http://127.0.0.1:${PORT}/ || exit 1
-    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "grpc" ]
-        HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-            CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:${PORT}/health 2>/dev/null || exit 1
-    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "orleans" ]
-        HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-            CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:${PORT}/health 2>/dev/null || exit 1
-    ENDIF
-    
-    # Set appropriate entrypoint based on deployment type
-    IF PROC [ "${ENABLE_AOT}" = "true" ]
-        # Native AOT executable
-        CMD ["./app"]
-    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "azure-functions" ]
-        CMD ["dotnet", "Microsoft.Azure.WebJobs.Script.WebHost.dll"]
-    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "aws-lambda" ]
-        CMD ["./bootstrap"]
-    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "orleans" ]
-        CMD ["dotnet", "app.dll"]
-    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "dapr" ]
-        # Dapr sidecar will be injected by Dapr runtime
-        CMD ["dotnet", "app.dll"]
-    ELSE IF PROC [ "${FRAMEWORK_TYPE}" = "aspire" ]
-        CMD ["dotnet", "app.dll"]
-    ELSE
-        # Standard ASP.NET Core or console app
-        CMD ["dotnet", "app.dll"]
-    ENDIF
+ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=${GLOBALIZATION_INVARIANT}
+ENV TMPDIR=/tmp
+ENV TEMP=/tmp
+ENV TMP=/tmp
+IF PROC [ "${ENABLE_RUNTIME_DIAGNOSTICS}" = "false" ]
+    ENV DOTNET_EnableDiagnostics=0
+    ENV COMPlus_EnableDiagnostics=0
 ENDIF
+EXPOSE ${PORT}
 
 # ============================================================================
 # RELEASE STAGE
 # ============================================================================
-FROM prod AS release
-
-# Metadata labels
-LABEL maintainer="@dexnore/dexfile"
+FROM app AS release
+USER 1654:1654
+IF PROC [ "${PROJECT_TYPE}" = "wasm" ]
+    WORKDIR ${NGINX_ROOT}
+    COPY --from=publish /app/publish/wwwroot/ ${NGINX_ROOT}/
+    USER nginx
+    EXPOSE 80
+    CMD ["nginx", "-g", "daemon off;"]
+ELSE
+    COPY --from=publish --chown=1654:1654 /app/publish/ ./
+    IF PROC [ "${ENABLE_AOT}" = "true" ]
+        CMD ["./app"]
+    ELSE
+        CMD ["dotnet", "app.dll"]
+    ENDIF
+ENDIF
+HEALTHCHECK NONE
 LABEL org.opencontainers.image.vendor="Dexnore"
-LABEL org.opencontainers.image.title=".NET Application"
-LABEL org.opencontainers.image.description="Production .NET application supporting ASP.NET Core, Blazor, Native AOT, and distributed frameworks"
-LABEL org.opencontainers.image.authors="@dexnore/dexfile"
-LABEL moby.buildkit.frontend.network.none="true"
-LABEL moby.buildkit.frontend.caps="moby.buildkit.frontend.inputs,moby.buildkit.frontend.subrequests,moby.buildkit.frontend.contexts"
-
-# Dynamic labels based on detection
+LABEL org.opencontainers.image.title="Production .NET Application"
+LABEL org.opencontainers.image.source="https://github.com/ep0ll/templates"
+LABEL org.opencontainers.image.language="csharp"
 LABEL app.framework="${FRAMEWORK_TYPE}"
 LABEL app.dotnet-version="${DOTNET_VERSION}"
 LABEL app.deployment-type="${DEPLOYMENT_TYPE}"
 LABEL app.package-manager="${PACKAGE_MANAGER}"
 LABEL app.native-aot="${ENABLE_AOT}"
-LABEL security.non-root="true"
+LABEL app.workspace="${WORKSPACE_TYPE}"
+LABEL app.target-rid="${TARGET_RID}"
+LABEL app.non-root="true"
+LABEL app.runtime-flavor="${RUNTIME_FLAVOR}"
 
 FROM release
+
+# ============================================================================
+# C# / .NET PRODUCTION STANDARD
+# ============================================================================
+# Ecosystems: .NET SDK/MSBuild, NuGet, private NuGet feeds, Paket, LibMan,
+# repository-local dotnet tools and central package management.
+# Workspaces: .sln, .slnx, nested csproj/fsproj/vbproj, Directory.Build.*,
+# Directory.Packages.props, packages.lock.json, global.json and dotnet-tools.
+# Frameworks: ASP.NET Core, Minimal APIs, MVC, Razor Pages, Blazor, SignalR,
+# gRPC, YARP, Worker Services, EF Core, Orleans, Dapr, Aspire, Azure Functions,
+# AWS Lambda and Native AOT.
+# Publishing: framework-dependent, self-contained, RID-specific, trimming,
+# single-file, ReadyToRun and Native AOT.
+#
+# Cache: dependency manifests precede source; NuGet packages and HTTP metadata
+# use BuildKit cache mounts; restore/build/publish remain separate stages.
+# Secrets: use PRIVATE_FEED_SECRET_ID (default nuget-config) for private feeds.
+# Never put package credentials in ARG, ENV or final image layers.
+# Reproducibility: pin SDK with global.json, commit lock files, use
+# RESTORE_LOCKED=true, pin TARGET_RID, and keep deterministic builds enabled.
+# Security: runtime is UID 1654; SDK/compiler/git/package tools never enter the
+# runtime; diagnostics are disabled by default; chiseled images omit shells and
+# package managers; health probes belong to the orchestrator.
+# Operations: generate SBOM/provenance, scan the image, push by digest, deploy
+# immutable digests, and inject secrets/configuration at runtime.
+# AOT/trimming require application-level compatibility validation for reflection,
+# dynamic loading and native dependencies. EF migrations should be explicit
+# deployment jobs rather than implicit startup mutations.
+# ============================================================================
