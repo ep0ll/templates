@@ -1,771 +1,165 @@
 # syntax=dexnore/dexfile:0
+# Universal Production-Ready PHP Dexfile
+# FrankenPHP (default), RoadRunner, FPM; Laravel/Symfony/WordPress; composer audit
 
-# ========================
-# Meta Stage: Global Configuration
-# ========================
 ARG PHP_VERSION=8.3
-ARG ALPINE_VERSION=3.20
-ARG BASE_OS=alpine
-ARG SERVER_MODE=auto
+ARG COMPOSER_VERSION=2
+ARG APP_ENV=production
+ARG APP_DEBUG=false
+ARG PORT=8080
+ARG ENABLE_COMPOSER_AUDIT=1
+ARG ENABLE_OPCACHE=1
+ARG ENABLE_JIT=1
+ARG JIT_BUFFER_SIZE=128M
+ARG MEMORY_LIMIT=256M
+ARG DOCUMENT_ROOT=/app/public
+ARG SKIP_NODE=0
 ARG NODE_VERSION=20
-ARG IPE_VERSION=1.6.0
+ARG APP_UID=10001
+ARG APP_GID=10001
+ARG APP_USER=dexfile
+ARG TZ=UTC
+ARG ROADRUNNER_VERSION=2024.2
+ARG BUILD_IMAGE
+ARG RUN_IMAGE
 
-# Auto-detect framework based on files
-ARG FRAMEWORK=auto
-ARG OPTIMIZE_FOR=production
-
-# ========================
-# Stage 0: Framework Detection
-# ========================
-FROM busybox:latest AS framework-detector
-
-WORKDIR /detect
+FROM busybox:latest AS validator
+WORKDIR /validate
 COPY . .
+RUN [ -f composer.json ] || [ -f index.php ] || [ -f public/index.php ] || [ -f artisan ] || [ -f wp-config.php ] || \
+    (echo "No PHP project markers" >&2; exit 1)
 
-# Create detection script
-RUN cat > /tmp/detect.sh <<'DETECT'
+FROM busybox:latest AS version-detector
+WORKDIR /detect
+COPY .php-version .tool-versions composer.json ./
+RUN <<'D'
 #!/bin/sh
-set -e
+V=""
+[ -f .php-version ] && V=$(cat .php-version | tr -d 'v \t\r\n')
+[ -z "$V" ] && [ -f composer.json ] && V=$(grep -oE '"php"\s*:\s*"[^"]+' composer.json 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+')
+[ -z "$V" ] && V="8.3"
+echo "$V" > /php-version
+D
 
-# Laravel detection
-if [ -f "artisan" ] && [ -f "composer.json" ]; then
-    grep -q "laravel/framework" composer.json 2>/dev/null && echo "laravel" && exit 0
-fi
+FROM busybox:latest AS framework-detector
+WORKDIR /detect
+COPY composer.json artisan* bin/console* wp-config.php* config/application.rb* ./
+RUN <<'D'
+#!/bin/sh
+FW="plain"; DOCROOT="public"
+[ -f artisan ] || grep -qE '"laravel/framework"' composer.json 2>/dev/null && FW="laravel"
+[ -f bin/console ] || grep -qE '"symfony/framework-bundle"' composer.json 2>/dev/null && FW="symfony"
+[ -f wp-config.php ] && FW="wordpress" && DOCROOT="."
+grep -qE '"drupal/core"' composer.json 2>/dev/null && FW="drupal"
+grep -qE '"slim/slim"' composer.json 2>/dev/null && FW="slim"
+[ -d public ] && DOCROOT="public"
+[ -d web ] && DOCROOT="web"
+echo "$FW" > /framework
+echo "$DOCROOT" > /document-root
+D
 
-# Symfony detection
-if [ -f "bin/console" ] && [ -f "symfony.lock" ]; then
-    echo "symfony" && exit 0
-fi
-
-# WordPress detection
-if [ -f "wp-config.php" ] || [ -f "wp-config-sample.php" ]; then
-    echo "wordpress" && exit 0
-fi
-
-# Drupal detection
-if [ -f "index.php" ] && [ -d "core" ] && [ -f "core/lib/Drupal.php" ]; then
-    echo "drupal" && exit 0
-fi
-
-# Magento detection
-if [ -f "bin/magento" ] && [ -d "app/etc" ]; then
-    echo "magento" && exit 0
-fi
-
-# CakePHP detection
-if [ -f "bin/cake" ] || ([ -f "composer.json" ] && grep -q "cakephp/cakephp" composer.json 2>/dev/null); then
-    echo "cakephp" && exit 0
-fi
-
-# CodeIgniter detection
-if [ -f "spark" ] || [ -f "system/CodeIgniter.php" ]; then
-    echo "codeigniter" && exit 0
-fi
-
-# Yii detection
-if [ -f "yii" ] && [ -f "composer.json" ] && grep -q "yiisoft/yii2" composer.json 2>/dev/null; then
-    echo "yii" && exit 0
-fi
-
-# Slim Framework detection
-if [ -f "composer.json" ] && grep -q "slim/slim" composer.json 2>/dev/null; then
-    echo "slim" && exit 0
-fi
-
-# Generic PHP application
-if [ -f "composer.json" ] || [ -f "index.php" ]; then
-    echo "generic" && exit 0
-fi
-
-echo "unknown"
-DETECT
-
-RUN chmod +x /tmp/detect.sh && /tmp/detect.sh > /tmp/framework.txt
-
-# ========================
-# Stage 1: Base Image Selection
-# ========================
-FROM php:${PHP_VERSION}-fpm-alpine${ALPINE_VERSION} AS base-alpine
-FROM php:${PHP_VERSION}-fpm-bookworm AS base-debian
-
-# Choose base based on OS preference
-IF RUN [ "${BASE_OS}" = "alpine" ]
-    FROM base-alpine AS base
-ELSE
-    FROM base-debian AS base
-ENDIF
-
-# ========================
-# Stage 2: System Foundation
-# ========================
-FROM base AS foundation
-
-ARG TARGETARCH
-ARG TARGETPLATFORM
-ARG IPE_VERSION
-ARG NODE_VERSION
-
-# Copy framework detection result
-COPY --from=framework-detector /tmp/framework.txt /tmp/framework.txt
-
-# Environment configuration
-ENV HOME=/root \
-    DEBIAN_FRONTEND=noninteractive \
-    COMPOSER_ALLOW_SUPERUSER=1 \
-    COMPOSER_HOME=/root/.composer \
-    PATH=/root/.composer/vendor/bin:/usr/local/bin:/opt/bin:$PATH \
-    PHP_MEMORY_LIMIT=512M \
-    PHP_MAX_EXECUTION_TIME=300 \
-    PHP_UPLOAD_MAX_FILESIZE=128M \
-    PHP_POST_MAX_SIZE=128M \
-    TZ=UTC \
-    APP_ENV=production \
-    APP_DEBUG=false
-
+FROM composer:${COMPOSER_VERSION} AS composer-base
 WORKDIR /app
+COPY composer.json composer.lock* ./
+ARG COMPOSER_ARGS="--no-dev --optimize-autoloader --classmap-authoritative --no-interaction"
+ENV COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_HOME=/tmp/composer
+RUN --mount=type=cache,target=/tmp/composer/cache,id=composer-cache \
+    if [ -f composer.lock ]; then composer install ${COMPOSER_ARGS} --no-scripts; else composer update ${COMPOSER_ARGS} --no-scripts; fi
 
-# Install system dependencies based on OS
-IF RUN [ -f /etc/alpine-release ]
-    RUN apk add --no-cache \
-        bash curl wget git unzip zip tar \
-        libzip-dev libpng-dev libjpeg-turbo-dev libwebp-dev freetype-dev \
-        libxml2-dev oniguruma-dev icu-dev \
-        postgresql-dev sqlite-dev \
-        imagemagick-dev bzip2-dev \
-        autoconf g++ make linux-headers \
-        shadow su-exec tzdata ca-certificates \
-        fcgi
-ELSE
-    RUN apt-get update && apt-get install -y --no-install-recommends \
-        bash curl wget git unzip zip tar ca-certificates \
-        libzip-dev libpng-dev libjpeg-dev libwebp-dev libfreetype6-dev \
-        libxml2-dev libonig-dev libicu-dev \
-        libpq-dev libsqlite3-dev \
-        libmagickwand-dev libbz2-dev \
-        build-essential autoconf pkg-config \
-        procps htop net-tools iputils-ping \
-        libfcgi-bin \
-        && rm -rf /var/lib/apt/lists/*
-ENDIF
-
-# Install PHP extension installer
-COPY --from=mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/local/bin/
-
-# Install core PHP extensions
-RUN install-php-extensions \
-    @composer \
-    opcache \
-    pdo_mysql \
-    pdo_pgsql \
-    mysqli \
-    pgsql \
-    gd \
-    zip \
-    bz2 \
-    intl \
-    bcmath \
-    soap \
-    sockets \
-    exif \
-    pcntl \
-    mbstring \
-    xml \
-    redis \
-    apcu \
-    imagick
-
-# Create application user
-RUN set -eux; \
-    if command -v useradd > /dev/null; then \
-        groupadd -r -g 1000 app && \
-        useradd -r -u 1000 -g app -m -s /bin/bash app; \
-    else \
-        addgroup -g 1000 app && \
-        adduser -u 1000 -G app -h /home/app -s /bin/bash -D app; \
-    fi; \
-    mkdir -p /app /var/log/php /run/php; \
-    chown -R app:app /app /var/log/php /run/php
-
-# ========================
-# Stage 3: Server Installation
-# ========================
-FROM foundation AS server-installer
-
-ARG SERVER_MODE
-
-# Detect which server to install based on framework and mode
-PROC --from=framework-detector cat /tmp/framework.txt
-ARG DETECTED_FRAMEWORK="${STDOUT}"
-
-# Install servers based on mode
-IF RUN [ "${SERVER_MODE}" = "auto" ] || [ "${SERVER_MODE}" = "nginx" ]
-    IF RUN [ -f /etc/alpine-release ]
-        RUN apk add --no-cache nginx
-    ELSE
-        RUN apt-get update && apt-get install -y --no-install-recommends nginx && rm -rf /var/lib/apt/lists/*
-    ENDIF
-ENDIF
-
-IF RUN [ "${SERVER_MODE}" = "auto" ] || [ "${SERVER_MODE}" = "apache" ]
-    IF RUN [ ! -f /etc/alpine-release ]
-        RUN apt-get update && apt-get install -y --no-install-recommends apache2 libapache2-mod-fcgid && rm -rf /var/lib/apt/lists/*
-        RUN a2dismod mpm_prefork && a2enmod mpm_event proxy_fcgi setenvif rewrite ssl headers http2
-    ENDIF
-ENDIF
-
-IF RUN [ "${SERVER_MODE}" = "caddy" ]
-    RUN if [ "$(uname -m)" = "x86_64" ]; then \
-            wget -O /tmp/caddy.tar.gz "https://caddyserver.com/api/download?os=linux&arch=amd64"; \
-        else \
-            wget -O /tmp/caddy.tar.gz "https://caddyserver.com/api/download?os=linux&arch=arm64"; \
-        fi && \
-        tar -xzf /tmp/caddy.tar.gz -C /usr/local/bin && \
-        chmod +x /usr/local/bin/caddy && \
-        rm /tmp/caddy.tar.gz
-ENDIF
-
-IF RUN [ "${SERVER_MODE}" = "frankenphp" ]
-    RUN FRANKEN_VERSION=$(wget -qO- https://api.github.com/repos/dunglas/frankenphp/releases/latest | grep tag_name | cut -d '"' -f 4) && \
-        wget -O /usr/local/bin/frankenphp \
-            "https://github.com/dunglas/frankenphp/releases/download/${FRANKEN_VERSION}/frankenphp-linux-$(uname -m)" && \
-        chmod +x /usr/local/bin/frankenphp
-ENDIF
-
-IF RUN [ "${SERVER_MODE}" = "roadrunner" ] || [ "${SERVER_MODE}" = "octane-rr" ]
-    RUN composer global require spiral/roadrunner-cli && \
-        ln -s /root/.composer/vendor/bin/rr /usr/local/bin/rr
-ENDIF
-
-IF RUN [ "${SERVER_MODE}" = "swoole" ] || [ "${SERVER_MODE}" = "octane-swoole" ] || [ "${DETECTED_FRAMEWORK}" = "laravel" ]
-    RUN install-php-extensions swoole
-ENDIF
-
-IF RUN [ "${SERVER_MODE}" = "openswoole" ]
-    RUN install-php-extensions openswoole
-ENDIF
-
-IF RUN [ "${SERVER_MODE}" = "unit" ]
-    IF RUN [ ! -f /etc/alpine-release ]
-        RUN wget -O /usr/share/keyrings/nginx-keyring.gpg \
-                https://unit.nginx.org/keys/nginx-keyring.gpg && \
-            echo "deb [signed-by=/usr/share/keyrings/nginx-keyring.gpg] https://packages.nginx.org/unit/debian/ bookworm unit" \
-                > /etc/apt/sources.list.d/unit.list && \
-            apt-get update && apt-get install -y unit unit-php
-    ENDIF
-ENDIF
-
-# Install Node.js for frontend builds
-IF RUN [ -f "package.json" ]
-    IF RUN [ -f /etc/alpine-release ]
-        RUN apk add --no-cache nodejs npm
-    ELSE
-        RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - && \
-            apt-get install -y nodejs
-    ENDIF
-    RUN npm install -g npm@latest yarn pnpm
-ENDIF
-
-# ========================
-# Stage 4: PHP Configuration
-# ========================
-FROM server-installer AS php-config
-
-# OPcache configuration
-RUN { \
-    echo "[opcache]"; \
-    echo "opcache.enable=1"; \
-    echo "opcache.enable_cli=0"; \
-    echo "opcache.memory_consumption=256"; \
-    echo "opcache.interned_strings_buffer=16"; \
-    echo "opcache.max_accelerated_files=20000"; \
-    echo "opcache.validate_timestamps=0"; \
-    echo "opcache.revalidate_freq=0"; \
-    echo "opcache.save_comments=1"; \
-    echo "opcache.fast_shutdown=1"; \
-    echo "opcache.preload_user=app"; \
-} > /usr/local/etc/php/conf.d/10-opcache.ini
-
-# PHP-FPM configuration
-RUN { \
-    echo "[global]"; \
-    echo "error_log = /var/log/php/fpm-error.log"; \
-    echo "log_level = warning"; \
-    echo "emergency_restart_threshold = 10"; \
-    echo "emergency_restart_interval = 1m"; \
-    echo "process_control_timeout = 10s"; \
-    echo "daemonize = no"; \
-    echo ""; \
-    echo "[www]"; \
-    echo "user = app"; \
-    echo "group = app"; \
-    echo "listen = 9000"; \
-    echo "listen.owner = app"; \
-    echo "listen.group = app"; \
-    echo "listen.mode = 0660"; \
-    echo "pm = dynamic"; \
-    echo "pm.max_children = 50"; \
-    echo "pm.start_servers = 10"; \
-    echo "pm.min_spare_servers = 5"; \
-    echo "pm.max_spare_servers = 20"; \
-    echo "pm.max_requests = 500"; \
-    echo "pm.status_path = /status"; \
-    echo "ping.path = /ping"; \
-    echo "ping.response = pong"; \
-    echo "catch_workers_output = yes"; \
-    echo "clear_env = no"; \
-    echo "slowlog = /var/log/php/fpm-slow.log"; \
-    echo "request_slowlog_timeout = 10s"; \
-} > /usr/local/etc/php-fpm.d/zz-docker.conf
-
-# PHP INI configuration
-RUN { \
-    echo "[PHP]"; \
-    echo "memory_limit = \${PHP_MEMORY_LIMIT}"; \
-    echo "max_execution_time = \${PHP_MAX_EXECUTION_TIME}"; \
-    echo "upload_max_filesize = \${PHP_UPLOAD_MAX_FILESIZE}"; \
-    echo "post_max_size = \${PHP_POST_MAX_SIZE}"; \
-    echo "max_input_vars = 5000"; \
-    echo "max_input_time = 300"; \
-    echo "default_socket_timeout = 60"; \
-    echo ""; \
-    echo "expose_php = Off"; \
-    echo "display_errors = Off"; \
-    echo "display_startup_errors = Off"; \
-    echo "log_errors = On"; \
-    echo "error_log = /var/log/php/error.log"; \
-    echo "error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT"; \
-    echo ""; \
-    echo "date.timezone = \${TZ}"; \
-    echo ""; \
-    echo "realpath_cache_size = 4096K"; \
-    echo "realpath_cache_ttl = 600"; \
-    echo ""; \
-    echo "session.save_handler = files"; \
-    echo "session.save_path = /tmp"; \
-    echo "session.use_strict_mode = 1"; \
-    echo "session.cookie_httponly = 1"; \
-    echo "session.cookie_samesite = Lax"; \
-    echo "session.cookie_secure = 1"; \
-} > /usr/local/etc/php/conf.d/99-production.ini
-
-# ========================
-# Stage 5: Server Configuration
-# ========================
-FROM php-config AS server-config
-
-# Nginx configuration
-RUN mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled && \
-    { \
-        echo "server {"; \
-        echo "    listen 80 default_server;"; \
-        echo "    listen [::]:80 default_server;"; \
-        echo "    server_name _;"; \
-        echo "    root /app/public;"; \
-        echo "    index index.php index.html;"; \
-        echo "    charset utf-8;"; \
-        echo ""; \
-        echo "    location / {"; \
-        echo "        try_files \\\$uri \\\$uri/ /index.php?\\\$query_string;"; \
-        echo "    }"; \
-        echo ""; \
-        echo "    location = /favicon.ico { access_log off; log_not_found off; }"; \
-        echo "    location = /robots.txt  { access_log off; log_not_found off; }"; \
-        echo ""; \
-        echo "    error_page 404 /index.php;"; \
-        echo ""; \
-        echo "    location ~ \\.php\$ {"; \
-        echo "        fastcgi_pass 127.0.0.1:9000;"; \
-        echo "        fastcgi_index index.php;"; \
-        echo "        fastcgi_param SCRIPT_FILENAME \\\$realpath_root\\\$fastcgi_script_name;"; \
-        echo "        include fastcgi_params;"; \
-        echo "        fastcgi_buffers 16 16k;"; \
-        echo "        fastcgi_buffer_size 32k;"; \
-        echo "    }"; \
-        echo ""; \
-        echo "    location ~ /\\.(?!well-known).* {"; \
-        echo "        deny all;"; \
-        echo "    }"; \
-        echo "}"; \
-    } > /etc/nginx/sites-available/default && \
-    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default || true
-
-# Apache configuration
-IF RUN [ -f /etc/apache2/apache2.conf ]
-    RUN { \
-        echo "<VirtualHost *:80>"; \
-        echo "    ServerAdmin webmaster@localhost"; \
-        echo "    DocumentRoot /app/public"; \
-        echo ""; \
-        echo "    <Directory /app/public>"; \
-        echo "        Options -Indexes +FollowSymLinks"; \
-        echo "        AllowOverride All"; \
-        echo "        Require all granted"; \
-        echo "    </Directory>"; \
-        echo ""; \
-        echo "    <FilesMatch \\.php\$>"; \
-        echo "        SetHandler 'proxy:fcgi://127.0.0.1:9000'"; \
-        echo "    </FilesMatch>"; \
-        echo ""; \
-        echo "    ErrorLog \\\${APACHE_LOG_DIR}/error.log"; \
-        echo "    CustomLog \\\${APACHE_LOG_DIR}/access.log combined"; \
-        echo "</VirtualHost>"; \
-    } > /etc/apache2/sites-available/000-default.conf
-ENDIF
-
-# Caddy configuration
-RUN mkdir -p /etc/caddy && \
-    { \
-        echo "{"; \
-        echo "    auto_https off"; \
-        echo "    admin off"; \
-        echo "}"; \
-        echo ""; \
-        echo ":80 {"; \
-        echo "    root * /app/public"; \
-        echo "    php_fastcgi 127.0.0.1:9000"; \
-        echo "    file_server"; \
-        echo "    encode gzip"; \
-        echo ""; \
-        echo "    log {"; \
-        echo "        output stdout"; \
-        echo "        format console"; \
-        echo "    }"; \
-        echo "}"; \
-    } > /etc/caddy/Caddyfile
-
-# RoadRunner configuration
-RUN { \
-    echo "version: '3'"; \
-    echo ""; \
-    echo "server:"; \
-    echo "  command: 'php worker.php'"; \
-    echo "  relay: 'pipes'"; \
-    echo ""; \
-    echo "http:"; \
-    echo "  address: '0.0.0.0:8080'"; \
-    echo "  max_request_size: 128"; \
-    echo "  pool:"; \
-    echo "    num_workers: 4"; \
-    echo "    max_jobs: 100"; \
-    echo "    allocate_timeout: 60s"; \
-    echo "    destroy_timeout: 60s"; \
-    echo ""; \
-    echo "logs:"; \
-    echo "  mode: production"; \
-    echo "  level: warn"; \
-} > /app/.rr.yaml
-
-# ========================
-# Stage 6: Dependency Installation
-# ========================
-FROM server-config AS dependencies
-
+FROM composer-base AS builder
 WORKDIR /app
+COPY --from=composer-base /app/vendor /app/vendor
+COPY . .
+ARG APP_ENV
+ENV APP_ENV=${APP_ENV} COMPOSER_ALLOW_SUPERUSER=1
+RUN composer dump-autoload --optimize --classmap-authoritative 2>/dev/null || true
+RUN if [ -f artisan ]; then \
+      php artisan package:discover --ansi 2>/dev/null || true; \
+      php artisan config:cache 2>/dev/null || true; \
+      php artisan route:cache 2>/dev/null || true; \
+      php artisan view:cache 2>/dev/null || true; \
+    fi
+RUN if [ -f bin/console ]; then php bin/console cache:warmup --env=prod 2>/dev/null || true; fi
 
-# Copy dependency manifests first (for caching)
-COPY --chown=app:app composer.json composer.lock* ./
+FROM composer-base AS composer-audit
+ARG ENABLE_COMPOSER_AUDIT
+COPY composer.json composer.lock* ./
+RUN if [ "${ENABLE_COMPOSER_AUDIT}" = "1" ]; then \
+      composer audit --no-interaction || (echo "audit issues; set ENABLE_COMPOSER_AUDIT=0" >&2; exit 1); \
+    else echo "audit skipped"; fi
 
-# Install PHP dependencies
-RUN --mount=type=cache,target=/root/.composer \
-    composer install \
-        --no-dev \
-        --no-scripts \
-        --no-autoloader \
-        --prefer-dist \
-        --no-interaction \
-        --optimize-autoloader
-
-# Install Node dependencies if package.json exists
-IF RUN [ -f "package.json" ]
-    COPY --chown=app:app package.json package-lock.json* yarn.lock* pnpm-lock.yaml* bun.lockb* .npmrc* .yarnrc* ./
-    
-    RUN if [ -f "pnpm-lock.yaml" ]; then \
-            pnpm install --prod --frozen-lockfile; \
-        elif [ -f "yarn.lock" ]; then \
-            yarn install --production --frozen-lockfile; \
-        elif [ -f "package-lock.json" ]; then \
-            npm ci --production; \
-        elif [ -f "package.json" ]; then \
-            npm install --production; \
-        fi
-ENDIF
-
-# ========================
-# Stage 7: Application Build
-# ========================
-FROM dependencies AS builder
-
-# Copy application code
-COPY --chown=app:app . .
-
-# Generate optimized autoloader
-RUN composer dump-autoload \
-    --optimize \
-    --no-dev \
-    --classmap-authoritative
-
-# Build frontend assets if needed
-IF RUN [ -f "vite.config.js" ] || [ -f "vite.config.ts" ] || [ -f "webpack.mix.js" ] || [ -f "webpack.config.js" ]
-    RUN if [ -f "vite.config.js" ] || [ -f "vite.config.ts" ]; then \
-            npm run build || yarn build || pnpm build || true; \
-        elif [ -f "webpack.mix.js" ]; then \
-            npm run production || yarn production || true; \
-        elif [ -f "webpack.config.js" ]; then \
-            npm run build:prod || yarn build:prod || true; \
-        fi
-ENDIF
-
-# Framework-specific optimizations
-PROC cat /tmp/framework.txt
-ARG DETECTED_FRAMEWORK="${STDOUT}"
-
-IF RUN [ "${DETECTED_FRAMEWORK}" = "laravel" ] && [ -f "artisan" ]
-    RUN php artisan config:cache && \
-        php artisan route:cache && \
-        php artisan view:cache && \
-        php artisan event:cache || true
-ENDIF
-
-IF RUN [ "${DETECTED_FRAMEWORK}" = "symfony" ] && [ -f "bin/console" ]
-    RUN php bin/console cache:clear --env=prod --no-debug && \
-        php bin/console cache:warmup --env=prod --no-debug || true
-ENDIF
-
-# Set correct permissions
-RUN find /app -type f -exec chmod 644 {} \; && \
-    find /app -type d -exec chmod 755 {} \; && \
-    if [ -f "artisan" ]; then chmod +x artisan; fi && \
-    if [ -f "bin/console" ]; then chmod +x bin/console; fi
-
-# ========================
-# Stage 8: Universal Entrypoint
-# ========================
-FROM builder AS runtime
-
-# Create intelligent entrypoint
-RUN cat > /usr/local/bin/docker-entrypoint.sh <<'ENTRYPOINT'
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Read detected framework
-FRAMEWORK=$(cat /tmp/framework.txt 2>/dev/null || echo "generic")
-
-# Environment variables
-SERVER_MODE="${SERVER_MODE:-auto}"
-HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-8080}"
-PHP_FPM_PORT="${PHP_FPM_PORT:-9000}"
-WORKERS="${WORKERS:-$(nproc)}"
-
-echo "🔍 Detected framework: $FRAMEWORK"
-echo "🚀 Server mode: $SERVER_MODE"
-
-# Handle CLI commands
-if [ "$#" -gt 0 ]; then
-    case "$1" in
-        artisan|bin/console|wp|drush|composer|php)
-            exec "$@"
-            ;;
-        bash|sh|/bin/bash|/bin/sh)
-            exec "$@"
-            ;;
-    esac
-fi
-
-# Auto-detect best server mode based on framework
-if [ "$SERVER_MODE" = "auto" ]; then
-    case "$FRAMEWORK" in
-        laravel)
-            if command -v rr > /dev/null && [ -f "artisan" ]; then
-                SERVER_MODE="octane-rr"
-            elif php -m | grep -q swoole && [ -f "artisan" ]; then
-                SERVER_MODE="octane-swoole"
-            else
-                SERVER_MODE="php-fpm"
-            fi
-            ;;
-        symfony)
-            if command -v frankenphp > /dev/null; then
-                SERVER_MODE="frankenphp"
-            else
-                SERVER_MODE="php-fpm"
-            fi
-            ;;
-        wordpress|drupal)
-            SERVER_MODE="php-fpm"
-            ;;
-        *)
-            SERVER_MODE="php-fpm"
-            ;;
-    esac
-fi
-
-echo "✅ Using server mode: $SERVER_MODE"
-
-# Determine document root
-DOC_ROOT="/app/public"
-if [ ! -d "/app/public" ]; then
-    DOC_ROOT="/app"
-fi
-
-# Start appropriate server
-case "$SERVER_MODE" in
-    php-fpm)
-        echo "▶️ Starting PHP-FPM on port $PHP_FPM_PORT"
-        exec php-fpm -F
-        ;;
-    
-    octane-swoole)
-        echo "▶️ Starting Laravel Octane (Swoole) on port $PORT"
-        exec php artisan octane:start \
-            --server=swoole \
-            --host="$HOST" \
-            --port="$PORT" \
-            --workers="$WORKERS"
-        ;;
-    
-    octane-rr)
-        echo "▶️ Starting Laravel Octane (RoadRunner) on port $PORT"
-        exec php artisan octane:start \
-            --server=roadrunner \
-            --host="$HOST" \
-            --port="$PORT" \
-            --rpc-port=6001 \
-            --workers="$WORKERS"
-        ;;
-    
-    frankenphp)
-        echo "▶️ Starting FrankenPHP on port $PORT"
-        cd "$DOC_ROOT" 2>/dev/null || cd /app
-        exec frankenphp php-server --listen "$HOST:$PORT"
-        ;;
-    
-    roadrunner|rr)
-        echo "▶️ Starting RoadRunner on port $PORT"
-        exec rr serve -c /app/.rr.yaml
-        ;;
-    
-    swoole)
-        echo "▶️ Starting Swoole on port $PORT"
-        if [ -f "/app/swoole.php" ]; then
-            exec php /app/swoole.php
-        else
-            echo "❌ swoole.php not found"
-            exit 1
-        fi
-        ;;
-    
-    caddy)
-        echo "▶️ Starting Caddy + PHP-FPM"
-        php-fpm -D
-        exec caddy run --config /etc/caddy/Caddyfile
-        ;;
-    
-    nginx)
-        echo "▶️ Starting Nginx + PHP-FPM"
-        php-fpm -D
-        exec nginx -g "daemon off;"
-        ;;
-    
-    dev)
-        echo "▶️ Starting PHP built-in server (DEV ONLY)"
-        cd "$DOC_ROOT"
-        exec php -S "$HOST:$PORT"
-        ;;
-    
-    *)
-        echo "❌ Unknown SERVER_MODE: $SERVER_MODE"
-        exit 1
-        ;;
-esac
-ENTRYPOINT
-
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
-
-# Health check script
-RUN cat > /usr/local/bin/healthcheck.sh <<'HEALTHCHECK'
-#!/usr/bin/env bash
-set -e
-
-SERVER_MODE="${SERVER_MODE:-php-fpm}"
-PORT="${PORT:-8080}"
-PHP_FPM_PORT="${PHP_FPM_PORT:-9000}"
-
-case "$SERVER_MODE" in
-    php-fpm|auto)
-        if command -v cgi-fcgi > /dev/null; then
-            SCRIPT_NAME=/ping SCRIPT_FILENAME=/ping REQUEST_METHOD=GET \
-                cgi-fcgi -bind -connect 127.0.0.1:$PHP_FPM_PORT || exit 1
-        else
-            wget -qO- http://localhost:$PHP_FPM_PORT/ping || exit 1
-        fi
-        ;;
-    *)
-        wget -qO- http://localhost:$PORT/ || curl -f http://localhost:$PORT/ || exit 1
-        ;;
-esac
-HEALTHCHECK
-
-RUN chmod +x /usr/local/bin/healthcheck.sh
-
-# ========================
-# Stage 9: Production Release
-# ========================
-FROM runtime AS production
-
+FROM ${RUN_IMAGE:-dunglas/frankenphp:1-php8.3} AS prod-frankenphp
+ARG PHP_VERSION PORT APP_UID APP_GID APP_USER TZ
+ARG ENABLE_OPCACHE ENABLE_JIT JIT_BUFFER_SIZE MEMORY_LIMIT APP_ENV APP_DEBUG
 WORKDIR /app
+USER root
+RUN install-php-extensions opcache pdo_mysql pdo_pgsql redis intl bcmath gd zip 2>/dev/null || \
+    docker-php-ext-install opcache pdo_mysql 2>/dev/null || true
+RUN printf '%s\n' "memory_limit=${MEMORY_LIMIT}" "expose_php=Off" "display_errors=Off" \
+    "log_errors=On" "error_log=/dev/stderr" "date.timezone=${TZ}" > /usr/local/etc/php/conf.d/zz-production.ini
+RUN if [ "${ENABLE_OPCACHE}" = "1" ]; then \
+      printf '%s\n' "opcache.enable=1" "opcache.memory_consumption=256" "opcache.validate_timestamps=0" \
+        "opcache.jit=1255" "opcache.jit_buffer_size=${JIT_BUFFER_SIZE}" > /usr/local/etc/php/conf.d/zz-opcache.ini; fi
+RUN groupadd --system --gid ${APP_GID} ${APP_USER} 2>/dev/null || true && \
+    useradd --system --uid ${APP_UID} --gid ${APP_GID} --home /home/${APP_USER} --shell /usr/sbin/nologin ${APP_USER} 2>/dev/null || true && \
+    mkdir -p /home/${APP_USER} /app /data/caddy && chown -R ${APP_UID}:${APP_GID} /home/${APP_USER} /app /data/caddy 2>/dev/null || true
+COPY --from=builder --chown=${APP_UID}:${APP_GID} /app /app
+COPY --from=framework-detector /framework /etc/dexfile-framework
+COPY --from=version-detector /php-version /etc/dexfile-php-version
+ENV APP_ENV=${APP_ENV} APP_DEBUG=${APP_DEBUG} SERVER_NAME=":${PORT}" HOME=/home/dexfile TZ=${TZ}
+WORKDIR /app
+USER ${APP_UID}:${APP_GID}
+EXPOSE ${PORT}
+CMD ["frankenphp", "run", "--config", "/etc/caddy/Caddyfile"]
 
-# Remove development tools
-IF RUN [ ! -f /etc/alpine-release ]
-    RUN apt-get purge -y build-essential autoconf pkg-config && \
-        apt-get autoremove -y && \
-        apt-get clean && \
-        rm -rf /var/lib/apt/lists/*
-ENDIF
+FROM php:${PHP_VERSION}-cli-bookworm AS prod-roadrunner
+ARG PORT APP_UID APP_GID APP_USER TZ ROADRUNNER_VERSION APP_ENV
+WORKDIR /app
+RUN apt-get update -qq && apt-get install --no-install-recommends -y git unzip libzip-dev libpq-dev curl && \
+    docker-php-ext-install pdo_mysql pdo_pgsql opcache zip && rm -rf /var/lib/apt/lists/*
+RUN curl -sSL "https://github.com/roadrunner-server/roadrunner/releases/download/v${ROADRUNNER_VERSION}/roadrunner-${ROADRUNNER_VERSION}-linux-amd64.tar.gz" \
+      | tar -xz -C /usr/local/bin --strip-components=1 2>/dev/null || \
+    (curl -sSL https://github.com/roadrunner-server/roadrunner/releases/latest/download/roadrunner-linux-amd64 -o /usr/local/bin/rr && chmod +x /usr/local/bin/rr)
+RUN groupadd --system --gid ${APP_GID} ${APP_USER} && \
+    useradd --system --uid ${APP_UID} --gid ${APP_GID} --home /home/${APP_USER} --shell /usr/sbin/nologin ${APP_USER} && \
+    mkdir -p /home/${APP_USER} /app && chown -R ${APP_UID}:${APP_GID} /home/${APP_USER} /app
+COPY --from=builder --chown=${APP_UID}:${APP_GID} /app /app
+RUN if [ ! -f /app/.rr.yaml ] && [ ! -f /app/.rr.yml ]; then \
+      printf '%s\n' 'version: "3"' 'server:' '  command: "php public/index.php"' 'http:' '  address: 0.0.0.0:8080' \
+        '  pool:' '    num_workers: 4' > /app/.rr.yaml; fi
+ENV APP_ENV=${APP_ENV} HOME=/home/dexfile TZ=${TZ}
+USER ${APP_UID}:${APP_GID}
+WORKDIR /app
+EXPOSE ${PORT}
+CMD ["rr", "serve", "-c", ".rr.yaml"]
 
-# Security hardening
-RUN rm -rf /tmp/* /var/tmp/* && \
-    find /app -name ".git" -type d -exec rm -rf {} + 2>/dev/null || true
+FROM php:${PHP_VERSION}-fpm-bookworm AS prod-fpm
+ARG APP_UID=10001 APP_GID=10001 APP_USER=dexfile APP_ENV=production MEMORY_LIMIT=256M TZ=UTC ENABLE_OPCACHE=1
+RUN apt-get update -qq && apt-get install --no-install-recommends -y libzip-dev libpq-dev libpng-dev libicu-dev && \
+    docker-php-ext-install pdo_mysql pdo_pgsql opcache zip bcmath intl gd && rm -rf /var/lib/apt/lists/*
+RUN printf '%s\n' "memory_limit=${MEMORY_LIMIT}" "expose_php=Off" "display_errors=Off" "date.timezone=${TZ}" > /usr/local/etc/php/conf.d/zz-production.ini
+RUN groupadd --system --gid ${APP_GID} ${APP_USER} 2>/dev/null || true && \
+    useradd --system --uid ${APP_UID} --gid ${APP_GID} --home /home/${APP_USER} --shell /usr/sbin/nologin ${APP_USER} 2>/dev/null || true && \
+    mkdir -p /home/${APP_USER} /app && chown -R ${APP_UID}:${APP_GID} /home/${APP_USER} /app
+COPY --from=builder --chown=${APP_UID}:${APP_GID} /app /app
+ENV APP_ENV=${APP_ENV} HOME=/home/dexfile
+WORKDIR /app
+USER ${APP_UID}:${APP_GID}
+EXPOSE 9000
+CMD ["php-fpm", "-F"]
 
-# Framework-specific permissions
-PROC cat /tmp/framework.txt
-ARG DETECTED_FRAMEWORK="${STDOUT}"
+FROM prod-frankenphp AS prod
+FROM prod AS release
+ARG PORT=8080 APP_UID=10001
+LABEL maintainer="@dexnore/dexfile" org.opencontainers.image.vendor="Dexnore" \
+      org.opencontainers.image.title="PHP Application" \
+      security.non-root="true" security.uid="${APP_UID}" app.language="php" app.port="${PORT}"
 
-IF RUN [ "${DETECTED_FRAMEWORK}" = "laravel" ]
-    RUN mkdir -p storage/framework/{sessions,views,cache} storage/logs bootstrap/cache && \
-        chown -R app:app storage bootstrap/cache && \
-        chmod -R 775 storage bootstrap/cache
-ENDIF
+FROM prod AS artisan
+ENTRYPOINT ["php", "artisan"]
+CMD ["list"]
 
-IF RUN [ "${DETECTED_FRAMEWORK}" = "symfony" ]
-    RUN mkdir -p var/cache var/log && \
-        chown -R app:app var && \
-        chmod -R 775 var
-ENDIF
+FROM prod AS migrate
+CMD ["php", "artisan", "migrate", "--force"]
 
-IF RUN [ "${DETECTED_FRAMEWORK}" = "wordpress" ]
-    RUN mkdir -p wp-content/uploads && \
-        chown -R app:app wp-content && \
-        chmod -R 775 wp-content
-ENDIF
-
-USER app
-
-EXPOSE 8080 9000
-
-HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
-    CMD ["/usr/local/bin/healthcheck.sh"]
-
-STOPSIGNAL SIGQUIT
-
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD []
-
-# ========================
-# Metadata
-# ========================
-LABEL org.opencontainers.image.title="Universal PHP Application" \
-      org.opencontainers.image.description="Auto-detecting PHP framework container" \
-      org.opencontainers.image.vendor="Dexnore" \
-      com.dexnore.auto-detect="true" \
-      com.dexnore.supports="laravel,symfony,wordpress,drupal,generic"
+FROM release
